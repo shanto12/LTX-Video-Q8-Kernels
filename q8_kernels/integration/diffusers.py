@@ -16,6 +16,25 @@ from ..functional.ops import (
 from .utils import get_attention_func, get_compute_dtype
 
 
+def _linear_call(layer, *args, **kwargs):
+    """
+    FP8Linear compatibility wrapper to unify calling patterns.
+    
+    Filters out unsupported arguments and preserves dtype when specified.
+    This prevents signature mismatches when different call sites pass
+    incompatible arguments to FP8Linear layers.
+    """
+    # Get the forward signature to see what arguments are supported
+    sig = inspect.signature(layer.forward)
+    valid_params = set(sig.parameters.keys())
+    
+    # Filter kwargs to only include parameters the layer supports
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+    
+    # Call with filtered arguments
+    return layer(*args, **filtered_kwargs)
+
+
 def attn_forward(
     self,
     hidden_states: torch.FloatTensor,
@@ -29,7 +48,7 @@ def attn_forward(
 ) -> torch.Tensor:
     r"""
     The forward method of the `Attention` class.
-
+    
     Args:
         hidden_states (`torch.Tensor`):
             The hidden states of the query.
@@ -43,15 +62,16 @@ def attn_forward(
             Controls which layers to skip for spatiotemporal guidance.
         **cross_attention_kwargs:
             Additional keyword arguments to pass along to the cross attention.
-
+            
     Returns:
         `torch.Tensor`: The output of the attention layer.
     """
     # The `Attention` class can call different attention processors / attention functions
     # here we simply pass along all tensors to the selected processor class
     # For standard processors that are defined here, `**cross_attention_kwargs` is empty
-
-    attn_parameters = set(inspect.signature(self.processor.__call__).parameters.keys())
+    attn_parameters = set(
+        inspect.signature(self.processor.__call__).parameters.keys()
+    )
     unused_kwargs = [
         k for k, _ in cross_attention_kwargs.items() if k not in attn_parameters
     ]
@@ -63,7 +83,6 @@ def attn_forward(
     cross_attention_kwargs = {
         k: w for k, w in cross_attention_kwargs.items() if k in attn_parameters
     }
-
     return self.processor(
         self,
         hidden_states,
@@ -77,326 +96,151 @@ def attn_forward(
     )
 
 
-def create_attn_processor():
-    self_attn_props, cross_attn_props, out_tuple = get_attention_func()
-    compute_dtype = get_compute_dtype()
+def get_attention_processors(
+    self, attention_class=None, hidden_size=None, cross_attention_dim=None
+):
+    if hasattr(self, "attn"):
+        if attention_class is not None:
+            raise ValueError(
+                "Cannot specify both attention_class and attn attribute"
+            )
+        attention_class = self.attn
+    elif attention_class is None:
+        raise ValueError(
+            "Must specify either attention_class or have attn attribute"
+        )
 
-    class AttnProcessor3_0:
-        r"""
-        Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
-        """
-
-        def __init__(self):
-            pass
-
-        def __call__(
-            self,
-            attn,
-            hidden_states: torch.FloatTensor,
-            hidden_states_scales: Optional[torch.FloatTensor],
-            freqs_cis: Tuple[torch.FloatTensor, torch.FloatTensor],
-            encoder_hidden_states: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            temb: Optional[torch.FloatTensor] = None,
-            skip_layer_mask: Optional[torch.FloatTensor] = None,
-            skip_layer_strategy: Optional[SkipLayerStrategy] = None,
-            *args,
-            **kwargs,
-        ) -> torch.FloatTensor:
-            if len(args) > 0 or kwargs.get("scale", None) is not None:
-                deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
-                deprecate("scale", "1.0.0", deprecation_message)
-
-            residual = hidden_states
-            if attn.spatial_norm is not None:
-                hidden_states = attn.spatial_norm(hidden_states, temb)
-
-            input_ndim = hidden_states.ndim
-
-            if input_ndim == 4:
-                batch_size, channel, height, width = hidden_states.shape
-                hidden_states = hidden_states.view(
-                    batch_size, channel, height * width
-                ).transpose(1, 2)
-
-            batch_size, sequence_length, _ = (
-                hidden_states.shape
-                if encoder_hidden_states is None
-                else encoder_hidden_states.shape
+    if hasattr(self, "config"):
+        hidden_size = hidden_size or self.config.hidden_size
+        cross_attention_dim = (
+            cross_attention_dim or self.config.cross_attention_dim
+        )
+    else:
+        if hidden_size is None or cross_attention_dim is None:
+            raise ValueError(
+                "Must specify hidden_size and cross_attention_dim if no config"
             )
 
-            if skip_layer_mask is not None:
-                skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1)
-
-            if (attention_mask is not None) and (not attn.use_tpu_flash_attention):
-                attention_mask = attn.prepare_attention_mask(
-                    attention_mask, sequence_length, batch_size
-                )
-                # scaled_dot_product_attention expects attention_mask shape to be
-                # (batch, heads, source_length, target_length)
-                attention_mask = attention_mask.view(
-                    batch_size, attn.heads, -1, attention_mask.shape[-1]
-                )
-
-            if attn.group_norm is not None:
-                hidden_states = attn.group_norm(
-                    hidden_states.transpose(1, 2)
-                ).transpose(1, 2)
-
-            if encoder_hidden_states is not None:
-                is_self_attention = False
-
-                query = attn.to_q(hidden_states, None, True)
-                query = attn.q_norm(query)
-
-                key = attn.to_k(encoder_hidden_states, None, True)
-                key = attn.k_norm(key)
-                value = attn.to_v(encoder_hidden_states, None, True)
-            else:  # if no context provided do self-attention
-                is_self_attention = True
-
-                query = attn.to_q(
-                    hidden_states, hidden_states_scales, False, torch.bfloat16
-                )
-                query = rms_norm_rope(
-                    query, freqs_cis[0], freqs_cis[1], attn.q_norm.weight
-                )
-
-                key = attn.to_k(
-                    hidden_states, hidden_states_scales, False, torch.bfloat16
-                )
-                key = rms_norm_rope(key, freqs_cis[0], freqs_cis[1], attn.k_norm.weight)
-
-                value = attn.to_v(
-                    hidden_states, hidden_states_scales, False, torch.bfloat16
-                )
-
-            value_for_stg = value
-
-            inner_dim = key.shape[-1]
-            head_dim = inner_dim // attn.heads
-
-            query = query.view(batch_size, -1, attn.heads, head_dim)
-            key = key.view(batch_size, -1, attn.heads, head_dim)
-            value = value.view(batch_size, -1, attn.heads, head_dim)
-
-            if is_self_attention:
-                query = self_attn_props[1](query)
-                key = self_attn_props[1](key)
-                value = self_attn_props[1](value)
-            else:
-                query = cross_attn_props[1](query)
-                key = cross_attn_props[1](key)
-                value = cross_attn_props[1](value)
-
-            # the output of sdp = (batch, num_heads, seq_len, head_dim)
-
-            if (
-                attn.use_tpu_flash_attention
-            ):  # use tpu attention offload 'flash attention'
-                q_segment_indexes = None
-                if (
-                    attention_mask is not None
-                ):  # if mask is required need to tune both segmenIds fields
-                    # attention_mask = torch.squeeze(attention_mask).to(torch.float32)
-                    attention_mask = attention_mask.to(torch.float32)
-                    q_segment_indexes = torch.ones(
-                        batch_size,
-                        query.shape[2],
-                        device=query.device,
-                        dtype=torch.float32,
-                    )
-                    assert (
-                        attention_mask.shape[1] == key.shape[2]
-                    ), f"ERROR: KEY SHAPE must be same as attention mask [{key.shape[2]}, {attention_mask.shape[1]}]"
-
-                assert (
-                    query.shape[2] % 128 == 0
-                ), f"ERROR: QUERY SHAPE must be divisible by 128 (TPU limitation) [{query.shape[2]}]"
-                assert (
-                    key.shape[2] % 128 == 0
-                ), f"ERROR: KEY SHAPE must be divisible by 128 (TPU limitation) [{key.shape[2]}]"
-
-                # run the TPU kernel implemented in jax with pallas
-                hidden_states_a = flash_attention(
-                    q=query,
-                    k=key,
-                    v=value,
-                    q_segment_ids=q_segment_indexes,
-                    kv_segment_ids=attention_mask,
-                    sm_scale=attn.scale,
-                )
-            else:
-                if is_self_attention:
-                    if out_tuple:
-                        hidden_states_a, _ = self_attn_props[0](query, key, value)
-                    else:
-                        hidden_states_a = self_attn_props[0](query, key, value)
-                else:
-                    hidden_states_a = F.scaled_dot_product_attention(
-                        query,
-                        key,
-                        value,
-                        attn_mask=attention_mask,
-                        dropout_p=0.0,
-                        is_causal=False,
-                    )
-            if is_self_attention:
-                hidden_states_a = self_attn_props[1](hidden_states_a).reshape(
-                    batch_size, -1, attn.heads * head_dim
-                )
-            else:
-                hidden_states_a = cross_attn_props[1](hidden_states_a).reshape(
-                    batch_size, -1, attn.heads * head_dim
-                )
-            hidden_states_a = hidden_states_a.to(query.dtype)
-
-            if (
-                skip_layer_mask is not None
-                and skip_layer_strategy == SkipLayerStrategy.AttentionSkip
-            ):
-                if is_self_attention:
-                    hidden_states = (
-                        hidden_states_a * skip_layer_mask
-                        + dequant_hadamard_transform(
-                            hidden_states, hidden_states_scales
-                        )
-                        * (1.0 - skip_layer_mask)
-                    )
-                else:
-                    hidden_states = (
-                        hidden_states_a * skip_layer_mask
-                        + hidden_states * (1.0 - skip_layer_mask)
-                    )
-                if compute_dtype == torch.float8_e4m3fn:
-                    hidden_states = hidden_states.to(torch.bfloat16)
-            elif (
-                skip_layer_mask is not None
-                and skip_layer_strategy == SkipLayerStrategy.AttentionValues
-            ):
-                hidden_states = hidden_states_a * skip_layer_mask + value_for_stg * (
-                    1.0 - skip_layer_mask
-                )
-            else:
-                hidden_states = hidden_states_a
-
-            # linear proj
-            hidden_states = attn.to_out[0](hidden_states, None, True)
-            # dropout
-            hidden_states = attn.to_out[1](hidden_states)
-
-            if input_ndim == 4:
-                hidden_states = hidden_states.transpose(-1, -2).reshape(
-                    batch_size, channel, height, width
-                )
-                if (
-                    skip_layer_mask is not None
-                    and skip_layer_strategy == SkipLayerStrategy.Residual
-                ):
-                    skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1, 1)
-
-            if attn.residual_connection:
-                if (
-                    skip_layer_mask is not None
-                    and skip_layer_strategy == SkipLayerStrategy.Residual
-                ):
-                    hidden_states = hidden_states + residual * skip_layer_mask
-                else:
-                    hidden_states = hidden_states + residual
-
-            hidden_states = hidden_states / attn.rescale_output_factor
-
-            return hidden_states
-
-    return AttnProcessor3_0
+    processors = {}
+    for name, module in self.named_modules():
+        if isinstance(module, attention_class):
+            processors[name] = module.processor
+    return processors
 
 
-def create_forwards():
-    compute_dtype = get_compute_dtype()
+def set_attention_processors(self, processors):
+    for name, processor in processors.items():
+        module = self.get_submodule(name)
+        module.set_processor(processor)
+
+
+def processor_factory(
+    attn_forward_fn, to_q_fn, to_k_fn, to_v_fn, to_out_0_fn, proj_fn, net_2_fn
+):
+    """
+    Factory function to create attention processor functions with proper FP8Linear support.
+    
+    All linear layer calls are routed through _linear_call to ensure compatibility.
+    """
 
     def fused_forward(
         self,
-        hidden_states: torch.FloatTensor,
-        freqs_cis: Optional[Tuple[torch.FloatTensor, torch.FloatTensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
-        cross_attention_kwargs: Dict[str, Any] = None,
-        class_labels: Optional[torch.LongTensor] = None,
-        sharding_mesh=None,
-        skip_layer_mask: Optional[torch.Tensor] = None,
-        skip_layer_strategy: Optional[SkipLayerStrategy] = None,
-    ) -> torch.FloatTensor:
-        if cross_attention_kwargs is not None:
-            if cross_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` to `cross_attention_kwargs` is depcrecated. `scale` will be ignored."
-                )
-        # Notice that normalization is always applied before the real computation in the following blocks.
-        # 0. Self-Attention
-        batch_size = hidden_states.shape[0]
+        hidden_states,
+        hidden_states_scales,
+        encoder_hidden_states=None,
+        encoder_hidden_states_scales=None,
+        attention_mask=None,
+        encoder_attention_mask=None,
+        freqs_cis=None,
+        skip_layer_mask=None,
+        skip_layer_strategy=None,
+        scale_msa=None,
+        shift_msa=None,
+        scale_mlp=None,
+        shift_mlp=None,
+        gate_msa=None,
+        gate_mlp=None,
+        **cross_attention_kwargs,
+    ):
+        compute_dtype = get_compute_dtype()
 
-        # norm_hidden_states = self.norm1(hidden_states)
-
-        # Apply ada_norm_single
-        if self.adaptive_norm in ["single_scale_shift", "single_scale"]:
-            assert timestep.ndim == 3  # [batch, 1 or num_tokens, embedding_dim]
-            num_ada_params = self.scale_shift_table.shape[0]
-            ada_values = self.scale_shift_table[None, None] + timestep.reshape(
-                batch_size, timestep.shape[1], num_ada_params, -1
+        if skip_layer_mask is not None and skip_layer_strategy is not None:
+            skip_condition = skip_layer_strategy.should_skip_layer(
+                skip_layer_mask, self.layer_id
             )
-            if self.adaptive_norm == "single_scale_shift":
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                    ada_values.unbind(dim=2)
-                )
-                norm_hidden_states, norm_hidden_states_scales = (
-                    norm_scale_shift_hadamard_transform(
-                        hidden_states,
-                        self.norm1.weight,
-                        scale_msa,
-                        shift_msa,
-                        compute_dtype,
-                    )
-                )
-                # norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-            else:
-                scale_msa, gate_msa, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
-                norm_hidden_states = norm_hidden_states * (1 + scale_msa)
+            if skip_condition:
+                return hidden_states
+
+        # 1. Self-Attention
+        if self.adaptive_norm == "single_scale_shift":
+            (
+                norm_hidden_states,
+                norm_hidden_states_scales,
+            ) = norm_scale_shift_hadamard_transform(
+                hidden_states,
+                self.norm.weight,
+                scale_msa,
+                shift_msa,
+                compute_dtype,
+            )
+        elif self.adaptive_norm == "single_scale":
+            norm_hidden_states = norm_hidden_states * (1 + scale_msa)
         elif self.adaptive_norm == "none":
-            scale_msa, gate_msa, scale_mlp, gate_mlp = None, None, None, None
+            norm_hidden_states = self.norm(hidden_states)
         else:
             raise ValueError(f"Unknown adaptive norm type: {self.adaptive_norm}")
 
-        norm_hidden_states = norm_hidden_states.squeeze(
-            1
-        )  # TODO: Check if this is needed
+        # 2. Prepare query, key, value
+        query = _linear_call(self.to_q, norm_hidden_states, norm_hidden_states_scales, out_dtype=compute_dtype)
+        
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+            encoder_hidden_states_scales = hidden_states_scales
+            
+        key = _linear_call(self.to_k, encoder_hidden_states, encoder_hidden_states_scales, out_dtype=compute_dtype)
+        value = _linear_call(self.to_v, encoder_hidden_states, encoder_hidden_states_scales, out_dtype=compute_dtype)
 
-        # 1. Prepare GLIGEN inputs
-        cross_attention_kwargs = (
-            cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-        )
+        # Apply RoPE if available
+        if freqs_cis is not None:
+            query, key = rms_norm_rope(
+                query,
+                key,
+                freqs_cis[0],
+                freqs_cis[1],
+                out_dtype=compute_dtype,
+            )
 
-        attn_output = self.attn1(
-            norm_hidden_states,
-            norm_hidden_states_scales,
-            freqs_cis=freqs_cis,
-            encoder_hidden_states=(
-                encoder_hidden_states if self.only_cross_attention else None
-            ),
-            attention_mask=attention_mask,
-            skip_layer_mask=skip_layer_mask,
-            skip_layer_strategy=skip_layer_strategy,
-            **cross_attention_kwargs,
+        # 3. Attention computation
+        attention_func = get_attention_func()
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // self.heads
+        
+        query = query.view(query.shape[0], -1, self.heads, head_dim).transpose(1, 2)
+        key = key.view(key.shape[0], -1, self.heads, head_dim).transpose(1, 2)
+        value = value.view(value.shape[0], -1, self.heads, head_dim).transpose(1, 2)
+        
+        hidden_states = attention_func(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
         )
+        
+        hidden_states = hidden_states.transpose(1, 2).reshape(query.shape[0], -1, inner_dim)
+        
+        # 4. Linear projection
+        hidden_states, hidden_states_scales = dequant_hadamard_transform(
+            hidden_states, out_dtype=compute_dtype
+        )
+        hidden_states = _linear_call(self.to_out[0], hidden_states, hidden_states_scales, out_dtype=torch.bfloat16)
+        
         if gate_msa is not None:
-            attn_output = gate_msa * attn_output
-
-        hidden_states = attn_output + hidden_states
-        if hidden_states.ndim == 4:
-            hidden_states = hidden_states.squeeze(1)
-
-        # 3. Cross-Attention
+            hidden_states = gate_msa * hidden_states
+        hidden_states = hidden_states + hidden_states
+        
+        # 5. Cross-Attention (if present)
         if self.attn2 is not None:
             if self.adaptive_norm == "none":
                 attn_input = self.attn2_norm(hidden_states)
@@ -411,9 +255,8 @@ def create_forwards():
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
-
-        # 4. Feed-forward
-        # norm_hidden_states = self.norm2(hidden_states)
+            
+        # 6. Feed-forward
         if self.adaptive_norm == "single_scale_shift":
             norm_hidden_states, norm_hidden_states_scales = (
                 norm_scale_shift_hadamard_transform(
@@ -424,14 +267,13 @@ def create_forwards():
                     compute_dtype,
                 )
             )
-            # norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
         elif self.adaptive_norm == "single_scale":
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp)
         elif self.adaptive_norm == "none":
             pass
         else:
             raise ValueError(f"Unknown adaptive norm type: {self.adaptive_norm}")
-
+            
         if self._chunk_size is not None:
             # "feed_forward_chunk_size" can be used to save memory
             ff_output = _chunked_feed_forward(
@@ -439,24 +281,24 @@ def create_forwards():
             )
         else:
             ff_output = self.ff(norm_hidden_states, norm_hidden_states_scales)
+            
         if gate_mlp is not None:
             ff_output = gate_mlp * ff_output
-
         hidden_states = ff_output + hidden_states
+        
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
-
         return hidden_states
-
+    
     def gelu_forward(self, hidden_states, hidden_states_scales):
-        hidden_states = self.proj(
-            hidden_states, hidden_states_scales, False, torch.bfloat16
+        hidden_states = _linear_call(
+            self.proj, hidden_states, hidden_states_scales, out_dtype=torch.bfloat16
         )
         hidden_states, hidden_states_scales = gelu_hadamard_transform(
             hidden_states, out_dtype=compute_dtype
         )
         return hidden_states, hidden_states_scales
-
+    
     def ff_forward(
         self,
         hidden_states: torch.Tensor,
@@ -466,9 +308,9 @@ def create_forwards():
         hidden_states, hidden_states_scales = self.net[0](
             hidden_states, hidden_states_scales
         )
-        hidden_states = self.net[2](
-            hidden_states, hidden_states_scales, False, out_dtype=torch.bfloat16
+        hidden_states = _linear_call(
+            self.net[2], hidden_states, hidden_states_scales, out_dtype=torch.bfloat16
         )
         return hidden_states
-
+    
     return fused_forward, gelu_forward, ff_forward
